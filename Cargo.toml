@@ -1,0 +1,10 @@
+[package]
+name = "ffmpeg_split_audit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+env_logger = "0.11.8"
+ffmpeg-next = "8.0.0"
+libc = "0.2.176"
+log = "0.4.28"
