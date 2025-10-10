@@ -1,16 +1,16 @@
 use anyhow::Context;
 use clap::Parser;
 use env_logger::Builder;
-use ffmpeg_next::format::{context, output};
+use ffmpeg_next::format::context;
 use log::LevelFilter;
 use std::collections::HashMap;
 use std::fs::File;
+
 use std::io::Write;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
 use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::ptr;
-
 #[derive(Parser, Debug)]
 #[command(name = "ffmpeg_split_audit")]
 #[command(author = "syyxy")]
@@ -19,13 +19,9 @@ struct Args {
     #[arg(short, long)]
     input: String,
 
-    /// 输出音频文件路径（可选）
+    /// 输出文件路径
     #[arg(short = 'o', long)]
-    audio_output_path: Option<String>,
-
-    /// 输出视频文件路径（可选）
-    #[arg(short = 'v', long)]
-    video_output_path: Option<String>,
+    output: Option<String>,
 
     /// 详细输出
     #[arg(long)]
@@ -33,88 +29,183 @@ struct Args {
 }
 
 struct AVFormatContextWrapper {
+    avformat_input_wrapper: AVFormatInputWrapper,
+    avformat_output_wrapper: AVFormatOutputWrapper,
+}
+
+struct AVFormatInputWrapper {
     format_ctx: *mut ffmpeg_next::ffi::AVFormatContext,
-    reader: ManuallyDrop<Box<BufReader<File>>>,
+    reader: Option<ManuallyDrop<Box<BufReader<File>>>>,
+}
+
+struct AVFormatOutputWrapper {
+    format_ctx: *mut ffmpeg_next::ffi::AVFormatContext,
+    writer: Option<ManuallyDrop<Box<BufWriter<File>>>>,
 }
 
 impl AVFormatContextWrapper {
-    fn new<T: AsRef<Path>>(path: T) -> Option<Self> {
+    fn new<T: AsRef<Path>>(path: T, input: bool, output: bool) -> Option<Self> {
         unsafe {
-            let mut format_ctx = ffmpeg_next::ffi::avformat_alloc_context();
+            let (reader, input_format_ctx) = if input {
+                let mut format_ctx = ffmpeg_next::ffi::avformat_alloc_context();
+                let buffer_size = 4 * 1024;
+                let buffer = ffmpeg_next::ffi::av_malloc(buffer_size) as *mut u8;
+                if buffer.is_null() {
+                    log::error!("Failed to allocate buffer");
+                    return None;
+                }
 
-            let buffer_size = 4 * 1024;
-            let buffer = ffmpeg_next::ffi::av_malloc(buffer_size) as *mut u8;
-            if buffer.is_null() {
-                log::error!("Failed to allocate buffer");
-                return None;
-            }
+                let file = File::open(path.as_ref()).unwrap();
+                let reader = ManuallyDrop::new(Box::new(BufReader::new(file)));
+                let reader_ptr = &**reader as *const BufReader<File> as *mut BufReader<File>;
 
-            let file = File::open(path.as_ref()).unwrap();
-            let reader = ManuallyDrop::new(Box::new(BufReader::new(file)));
-            let reader_ptr = &**reader as *const BufReader<File> as *mut BufReader<File>;
+                (*format_ctx).pb = ffmpeg_next::ffi::avio_alloc_context(
+                    buffer,
+                    buffer_size as libc::c_int,
+                    0,
+                    reader_ptr as *mut libc::c_void,
+                    Some(self_read_packet),
+                    None,
+                    Some(self_seek),
+                );
 
-            (*format_ctx).pb = ffmpeg_next::ffi::avio_alloc_context(
-                buffer,
-                buffer_size as libc::c_int,
-                0,
-                reader_ptr as *mut libc::c_void,
-                Some(self_read_packet),
-                None,
-                Some(self_seek),
-            );
+                if (*format_ctx).pb.is_null() {
+                    log::error!("Failed to allocate buffer");
+                    ffmpeg_next::ffi::av_free(buffer as *mut _);
+                    ffmpeg_next::ffi::avformat_free_context(format_ctx);
+                    ManuallyDrop::drop(&mut ManuallyDrop::new(reader));
+                    return None;
+                }
+                let result = ffmpeg_next::ffi::avformat_open_input(
+                    &mut format_ctx,
+                    ptr::null(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
+                if result < 0 {
+                    log::error!("Failed to open input");
+                    ffmpeg_next::ffi::av_free(buffer as *mut _);
+                    ffmpeg_next::ffi::avformat_free_context(format_ctx);
+                    ManuallyDrop::drop(&mut ManuallyDrop::new(reader));
+                    return None;
+                }
 
-            if (*format_ctx).pb.is_null() {
-                log::error!("Failed to allocate buffer");
-                ffmpeg_next::ffi::av_free(buffer as *mut _);
-                ffmpeg_next::ffi::avformat_free_context(format_ctx);
-                ManuallyDrop::drop(&mut ManuallyDrop::new(reader));
-                return None;
-            }
-            let result = ffmpeg_next::ffi::avformat_open_input(
-                &mut format_ctx,
-                ptr::null(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            );
-            if result < 0 {
-                log::error!("Failed to open input");
-                ffmpeg_next::ffi::av_free(buffer as *mut _);
-                ffmpeg_next::ffi::avformat_free_context(format_ctx);
-                ManuallyDrop::drop(&mut ManuallyDrop::new(reader));
-                return None;
-            }
+                (Some(reader), format_ctx)
+            } else {
+                (None, ptr::null_mut())
+            };
 
-            Some(Self { format_ctx, reader })
+            let (writer, output_format_ctx) = if output {
+                let mut format_ctx: *mut ffmpeg_next::ffi::AVFormatContext = ptr::null_mut();
+
+                // 将路径转换为 C 字符串
+                let path_str = path.as_ref().to_str().ok_or("Invalid path").ok()?;
+                let path_cstr = std::ffi::CString::new(path_str).ok()?;
+
+                let buffer_size = 4 * 1024;
+                let buffer = ffmpeg_next::ffi::av_malloc(buffer_size) as *mut u8;
+                if buffer.is_null() {
+                    log::error!("Failed to allocate buffer");
+                    return None;
+                }
+
+                if let Some(parent) = path.as_ref().parent() {
+                    std::fs::create_dir_all(parent)
+                        .context(format!("创建输出目录失败: {:?}", parent))
+                        .ok();
+                }
+
+                let file = File::create(path.as_ref()).unwrap();
+                let writer: ManuallyDrop<Box<BufWriter<File>>> =
+                    ManuallyDrop::new(Box::new(BufWriter::new(file)));
+                let writer_ptr = &**writer as *const BufWriter<File> as *mut BufWriter<File>;
+
+                let result = ffmpeg_next::ffi::avformat_alloc_output_context2(
+                    &mut format_ctx,
+                    ptr::null_mut(),
+                    ptr::null(),
+                    path_cstr.as_ptr(),
+                );
+
+                if result < 0 {
+                    log::error!("Failed to open output");
+                    ffmpeg_next::ffi::avformat_free_context(format_ctx);
+                    ManuallyDrop::drop(&mut ManuallyDrop::new(writer));
+                    ffmpeg_next::ffi::av_free(buffer as *mut _);
+                    return None;
+                }
+
+                (*format_ctx).pb = ffmpeg_next::ffi::avio_alloc_context(
+                    buffer,
+                    buffer_size as libc::c_int,
+                    1,
+                    writer_ptr as *mut libc::c_void,
+                    None,
+                    Some(self_write_packet),
+                    Some(self_seek_for_output),
+                );
+
+                if (*format_ctx).pb.is_null() {
+                    log::error!("Failed to allocate buffer");
+                    ffmpeg_next::ffi::av_free(buffer as *mut _);
+                    ffmpeg_next::ffi::avformat_free_context(format_ctx);
+                    ManuallyDrop::drop(&mut ManuallyDrop::new(writer));
+                    return None;
+                }
+
+                (*format_ctx).flags |= ffmpeg_next::ffi::AVFMT_FLAG_CUSTOM_IO;
+
+                (Some(writer), format_ctx)
+            } else {
+                (None, ptr::null_mut())
+            };
+
+            Some(Self {
+                avformat_input_wrapper: AVFormatInputWrapper {
+                    format_ctx: input_format_ctx,
+                    reader: reader,
+                },
+                avformat_output_wrapper: AVFormatOutputWrapper {
+                    format_ctx: output_format_ctx,
+                    writer: writer,
+                },
+            })
         }
     }
 
     fn into_input(mut self) -> (context::Input, Box<BufReader<File>>) {
         unsafe {
-            let format_ctx = self.format_ctx;
-            self.format_ctx = ptr::null_mut();
+            let format_ctx = self.avformat_input_wrapper.format_ctx;
+            self.avformat_input_wrapper.format_ctx = ptr::null_mut();
 
-            let reader = ManuallyDrop::take(&mut self.reader);
+            let reader =
+                ManuallyDrop::take(&mut self.avformat_input_wrapper.reader.take().unwrap());
 
             (context::Input::wrap(format_ctx), reader)
         }
     }
 
+    fn into_output(mut self) -> (context::Output, Box<BufWriter<File>>) {
+        unsafe {
+            let format_ctx = self.avformat_output_wrapper.format_ctx;
+            self.avformat_output_wrapper.format_ctx = ptr::null_mut();
+
+            let writer =
+                ManuallyDrop::take(&mut self.avformat_output_wrapper.writer.take().unwrap());
+
+            (context::Output::wrap(format_ctx), writer)
+        }
+    }
+
     fn drop(&mut self) {
         unsafe {
-            if !self.format_ctx.is_null() {
-                let avio_context = (*self.format_ctx).pb;
+            if let Some(ref mut reader) = self.avformat_input_wrapper.reader {
+                ManuallyDrop::drop(reader);
+            }
 
-                if !avio_context.is_null() {
-                    let reader_data = (*avio_context).opaque;
-                    if !reader_data.is_null() {
-                        (*avio_context).opaque = ptr::null_mut();
-                        let mut avio_ctx = avio_context;
-                        ffmpeg_next::ffi::avio_context_free(&mut avio_ctx as *mut _);
-                    }
-
-                    ffmpeg_next::ffi::avformat_close_input(&mut self.format_ctx);
-                    ManuallyDrop::drop(&mut self.reader);
-                }
+            if let Some(ref mut writer) = self.avformat_output_wrapper.writer {
+                let _ = writer.flush();
+                ManuallyDrop::drop(writer);
             }
         }
     }
@@ -139,6 +230,26 @@ unsafe extern "C" fn self_read_packet(
     }
 }
 
+unsafe extern "C" fn self_seek_for_output(
+    opaque: *mut libc::c_void,
+    offset: i64,
+    whence: libc::c_int,
+) -> i64 {
+    let writer = unsafe { &mut *(opaque as *mut BufWriter<File>) };
+
+    let seek_pos = match whence {
+        ffmpeg_next::ffi::SEEK_CUR => SeekFrom::Current(offset),
+        ffmpeg_next::ffi::SEEK_END => SeekFrom::End(offset),
+        ffmpeg_next::ffi::SEEK_SET => SeekFrom::Start(offset as u64),
+        _ => return -1,
+    };
+
+    match writer.seek(seek_pos) {
+        Ok(pos) => pos as i64,
+        Err(_) => return -1,
+    }
+}
+
 unsafe extern "C" fn self_seek(opaque: *mut libc::c_void, offset: i64, whence: libc::c_int) -> i64 {
     let reader = unsafe { &mut *(opaque as *mut BufReader<File>) };
 
@@ -155,11 +266,19 @@ unsafe extern "C" fn self_seek(opaque: *mut libc::c_void, offset: i64, whence: l
     }
 }
 
-fn create_self_output_context<T: AsRef<Path>>(path: T) -> context::Output {
-    output(&path).unwrap_or_else(|e| {
-        log::error!("Failed to create output context: {:?}", e);
-        std::process::exit(1);
-    })
+unsafe extern "C" fn self_write_packet(
+    opaque: *mut libc::c_void,
+    buf: *mut u8,
+    buf_size: libc::c_int,
+) -> libc::c_int {
+    unsafe {
+        let writer = &mut *(opaque as *mut BufWriter<File>);
+        let slice = std::slice::from_raw_parts(buf, buf_size as usize);
+        match writer.write(slice) {
+            Ok(size) => size as libc::c_int,
+            Err(_) => -1,
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -183,12 +302,12 @@ fn main() -> anyhow::Result<()> {
     analyze_input(&args.input)?;
 
     // 如果没有提供音频输出路径，就只分析不提取
-    if args.audio_output_path.is_none() {
+    if args.output.is_none() {
         log::info!("未指定音频输出路径，仅执行分析");
         return Ok(());
     }
 
-    let avformat_wrapper = AVFormatContextWrapper::new(args.input);
+    let avformat_wrapper = AVFormatContextWrapper::new(args.input, true, false);
     let (mut self_input, _reader) = avformat_wrapper.unwrap().into_input();
 
     let mut self_output_audios = Vec::new();
@@ -228,7 +347,7 @@ fn main() -> anyhow::Result<()> {
         let file_suffix = audio_stream.parameters().id().name().to_string();
         log::info!("file_suffix: {:?}", file_suffix);
         let output_path = args
-            .audio_output_path
+            .output
             .as_ref()
             .ok_or(anyhow::anyhow!("audio_output is required"))
             .map(|path| {
@@ -243,42 +362,40 @@ fn main() -> anyhow::Result<()> {
 
         log::info!("output_path: {:?}", output_path);
 
+        let avformat_wrapper_output = AVFormatContextWrapper::new(&output_path, false, true);
+        let (mut self_output, _writer) = avformat_wrapper_output.unwrap().into_output();
+
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent).context(format!("创建输出目录失败: {:?}", parent))?;
         }
 
-        let mut self_output_audio = create_self_output_context(output_path);
-
-        let mut output_audio_steam = self_output_audio
+        let mut output_audio_steam = self_output
             .add_stream(ffmpeg_next::encoder::find(audio_stream.parameters().id()))
             .context("添加音频流失败")?;
 
         output_audio_steam.set_parameters(audio_stream.parameters());
 
-        self_output_audio
-            .write_header()
-            .context("写入音频文件头失败")?;
+        self_output.write_header().context("写入音频文件头失败")?;
 
         if let Some(packets) = audio_packets.get_mut(&stream_index) {
             for p in packets {
                 p.set_stream(0);
-                p.write_interleaved(&mut self_output_audio)
+                p.write_interleaved(&mut self_output)
                     .context("写入音频包失败")?;
             }
         }
 
-        self_output_audio
-            .write_trailer()
-            .context("写入音频文件尾失败")?;
+        self_output.write_trailer().context("写入音频文件尾失败")?;
 
-        self_output_audios.push(self_output_audio);
+        self_output_audios.push(self_output);
     }
 
     Ok(())
 }
+
 fn analyze_input(input: &str) -> anyhow::Result<()> {
     // 打开输入文件
-    let avformat_wrapper = AVFormatContextWrapper::new(input)
+    let avformat_wrapper = AVFormatContextWrapper::new(input, true, false)
         .ok_or_else(|| anyhow::anyhow!("无法打开输入文件: {}", input))?;
 
     let (self_input, _reader) = avformat_wrapper.into_input();

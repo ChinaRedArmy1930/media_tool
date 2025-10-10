@@ -102,7 +102,7 @@ fi
 
 cargo run --release -- \
     --input "$TEST_OUTPUT_DIR/$TEST_VIDEO_NAME" \
-    --audio-output-path "$AUDIO_OUTPUT_BASE" \
+    --output "$AUDIO_OUTPUT_BASE" \
     || { echo -e "${RED}音频提取失败！${NC}"; exit 1; }
 echo -e "${YELLOW}─────────────────────────────────────────${NC}"
 
