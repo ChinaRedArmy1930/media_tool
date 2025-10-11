@@ -281,6 +281,45 @@ unsafe extern "C" fn self_write_packet(
     }
 }
 
+struct OutputWithCustomIO {
+    output: ManuallyDrop<context::Output>,
+    writer: Box<BufWriter<File>>,
+}
+
+impl OutputWithCustomIO {
+    fn new(output: context::Output, writer: Box<BufWriter<File>>) -> Self {
+        Self {
+            output: ManuallyDrop::new(output),
+            writer: writer,
+        }
+    }
+
+    fn output_mut(&mut self) -> &mut context::Output {
+        &mut self.output
+    }
+}
+
+impl Drop for OutputWithCustomIO {
+    fn drop(&mut self) {
+        unsafe {
+            let format_ctx = self.output.as_mut_ptr();
+
+            if !(*format_ctx).pb.is_null() {
+                let pb = (*format_ctx).pb;
+                ffmpeg_next::ffi::avio_flush(pb);
+                let buffer = (*pb).buffer;
+                (*format_ctx).pb = ptr::null_mut();
+                let mut pb_temp = pb;
+                ffmpeg_next::ffi::avio_context_free(&mut pb_temp);
+                ffmpeg_next::ffi::av_free(buffer as *mut _);
+            }
+
+            ManuallyDrop::drop(&mut self.output);
+            let _ = self.writer.flush();
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -361,32 +400,41 @@ fn main() -> anyhow::Result<()> {
         log::info!("output_path: {:?}", output_path);
 
         let avformat_wrapper_output = AVFormatContextWrapper::new(&output_path, false, true);
-        let (mut self_output, mut _writer) = avformat_wrapper_output.unwrap().into_output();
+        let (self_output, writer) = avformat_wrapper_output.unwrap().into_output();
+
+        let mut output_with_custom_io = OutputWithCustomIO::new(self_output, writer);
 
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent).context(format!("创建输出目录失败: {:?}", parent))?;
         }
 
-        let mut output_audio_steam = self_output
+        let mut output_audio_steam = output_with_custom_io
+            .output_mut()
             .add_stream(ffmpeg_next::encoder::find(audio_stream.parameters().id()))
             .context("添加音频流失败")?;
 
         output_audio_steam.set_parameters(audio_stream.parameters());
 
-        self_output.write_header().context("写入音频文件头失败")?;
+        output_with_custom_io
+            .output_mut()
+            .write_header()
+            .context("写入音频文件头失败")?;
 
         if let Some(packets) = audio_packets.get_mut(&stream_index) {
             for p in packets {
                 p.set_stream(0);
-                p.write_interleaved(&mut self_output)
+                p.write_interleaved(output_with_custom_io.output_mut())
                     .context("写入音频包失败")?;
             }
         }
 
-        self_output.write_trailer().context("写入音频文件尾失败")?;
+        output_with_custom_io
+            .output_mut()
+            .write_trailer()
+            .context("写入音频文件尾失败")?;
 
         unsafe {
-            let format_ctx = self_output.as_mut_ptr();
+            let format_ctx = output_with_custom_io.output_mut().as_mut_ptr();
 
             if !(*format_ctx).pb.is_null() {
                 let pb = (*format_ctx).pb;
