@@ -310,8 +310,6 @@ fn main() -> anyhow::Result<()> {
     let avformat_wrapper = AVFormatContextWrapper::new(args.input, true, false);
     let (mut self_input, _reader) = avformat_wrapper.unwrap().into_input();
 
-    let mut self_output_audios = Vec::new();
-
     let mut video_packets = HashMap::new();
     let mut audio_packets = HashMap::new();
 
@@ -363,7 +361,7 @@ fn main() -> anyhow::Result<()> {
         log::info!("output_path: {:?}", output_path);
 
         let avformat_wrapper_output = AVFormatContextWrapper::new(&output_path, false, true);
-        let (mut self_output, _writer) = avformat_wrapper_output.unwrap().into_output();
+        let (mut self_output, mut _writer) = avformat_wrapper_output.unwrap().into_output();
 
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent).context(format!("创建输出目录失败: {:?}", parent))?;
@@ -387,7 +385,29 @@ fn main() -> anyhow::Result<()> {
 
         self_output.write_trailer().context("写入音频文件尾失败")?;
 
-        self_output_audios.push(self_output);
+        unsafe {
+            let format_ctx = self_output.as_mut_ptr();
+
+            if !(*format_ctx).pb.is_null() {
+                let pb = (*format_ctx).pb;
+
+                // 刷新缓冲
+                ffmpeg_next::ffi::avio_flush(pb);
+
+                // 保存 buffer 指针
+                let buffer = (*pb).buffer;
+
+                // 将 pb 设为 null（这样 ffmpeg-next 的析构就不会调用 avio_close）
+                (*format_ctx).pb = ptr::null_mut();
+
+                // 释放 AVIOContext（使用 avio_context_free，不是 avio_close）
+                let mut pb_temp = pb;
+                ffmpeg_next::ffi::avio_context_free(&mut pb_temp);
+
+                // 释放 buffer
+                ffmpeg_next::ffi::av_free(buffer as *mut _);
+            }
+        }
     }
 
     Ok(())
