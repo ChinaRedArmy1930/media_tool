@@ -146,9 +146,6 @@ fi
 TOTAL_SIZE_MB=$((TOTAL_SIZE / 1024 / 1024))
 echo -e "${GREEN}  总大小: ${TOTAL_SIZE_MB} MB${NC}"
 
-echo -e "\n${YELLOW}[5/5] 清理测试文件...${NC}"
-rm -rf "$AUDIO_OUTPUT_BASE"
-echo -e "${GREEN}✓ 已清理音频输出目录: $AUDIO_OUTPUT_BASE${NC}"
 
 echo -e "\n${GREEN}========================================${NC}"
 echo -e "${GREEN}  ✓ 所有测试通过！${NC}"

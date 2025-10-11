@@ -360,13 +360,13 @@ fn main() -> anyhow::Result<()> {
                 video_packets
                     .entry(s.index())
                     .or_insert_with(Vec::new)
-                    .push(p);
+                    .push(p.clone());
             }
             ffmpeg_next::media::Type::Audio => {
                 audio_packets
                     .entry(s.index())
                     .or_insert_with(Vec::new)
-                    .push(p);
+                    .push(p.clone());
             }
 
             _ => {
@@ -397,7 +397,7 @@ fn main() -> anyhow::Result<()> {
                 ))
             })?;
 
-        log::info!("output_path: {:?}", output_path);
+        log::info!("audio output path: {:?}", output_path);
 
         let avformat_wrapper_output = AVFormatContextWrapper::new(&output_path, false, true);
         let (self_output, writer) = avformat_wrapper_output.unwrap().into_output();
@@ -432,33 +432,80 @@ fn main() -> anyhow::Result<()> {
             .output_mut()
             .write_trailer()
             .context("写入音频文件尾失败")?;
+    }
 
-        unsafe {
-            let format_ctx = output_with_custom_io.output_mut().as_mut_ptr();
+    let video_streams = self_input
+        .streams()
+        .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video);
 
-            if !(*format_ctx).pb.is_null() {
-                let pb = (*format_ctx).pb;
+    for (idx, video_stream) in video_streams.enumerate() {
+        let stream_index = video_stream.index();
+        let file_suffix = get_best_video_container_for_codec(video_stream.parameters().id().name());
+        log::info!("file_suffix: {:?}", file_suffix);
+        let output_path = args
+            .output
+            .as_ref()
+            .ok_or(anyhow::anyhow!("video_output is required"))
+            .map(|path| {
+                let p = Path::new(path);
+                p.parent().unwrap_or(Path::new(".")).join(format!(
+                    "{}/video_{}.{}",
+                    p.file_stem().and_then(|s| s.to_str()).unwrap_or("output"),
+                    idx,
+                    file_suffix
+                ))
+            })?;
 
-                // 刷新缓冲
-                ffmpeg_next::ffi::avio_flush(pb);
+        log::info!("video output path: {:?}", output_path);
 
-                // 保存 buffer 指针
-                let buffer = (*pb).buffer;
+        let avformat_wrapper_output = AVFormatContextWrapper::new(&output_path, false, true);
+        let (self_output, writer) = avformat_wrapper_output.unwrap().into_output();
 
-                // 将 pb 设为 null（这样 ffmpeg-next 的析构就不会调用 avio_close）
-                (*format_ctx).pb = ptr::null_mut();
+        let mut output_with_custom_io = OutputWithCustomIO::new(self_output, writer);
 
-                // 释放 AVIOContext（使用 avio_context_free，不是 avio_close）
-                let mut pb_temp = pb;
-                ffmpeg_next::ffi::avio_context_free(&mut pb_temp);
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent).context(format!("创建输出目录失败: {:?}", parent))?;
+        }
 
-                // 释放 buffer
-                ffmpeg_next::ffi::av_free(buffer as *mut _);
+        let mut output_video_steam = output_with_custom_io
+            .output_mut()
+            .add_stream(ffmpeg_next::encoder::find(video_stream.parameters().id()))
+            .context("添加视频流失败")?;
+
+        output_video_steam.set_parameters(video_stream.parameters());
+
+        output_with_custom_io
+            .output_mut()
+            .write_header()
+            .context("写入视频文件头失败")?;
+
+        if let Some(packets) = video_packets.get_mut(&stream_index) {
+            for p in packets {
+                p.set_stream(0);
+                p.write_interleaved(output_with_custom_io.output_mut())
+                    .context("写入视频包失败")?;
             }
         }
+
+        output_with_custom_io
+            .output_mut()
+            .write_trailer()
+            .context("写入视频文件尾失败")?;
     }
 
     Ok(())
+}
+
+fn get_best_video_container_for_codec(codec_name: &str) -> &'static str {
+    match codec_name {
+        "h264" | "h265" | "hevc" | "mpeg4" | "mjpeg" => "mp4",
+        "vp8" | "vp9" => "webm",
+        "av1" => "mkv", // 或 "webm"
+        "theora" => "ogv",
+
+        // 默认
+        _ => "mkv", // MKV 是万能容器，几乎支持所有格式
+    }
 }
 
 fn analyze_input(input: &str) -> anyhow::Result<()> {
