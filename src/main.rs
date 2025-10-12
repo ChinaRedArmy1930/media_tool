@@ -44,17 +44,38 @@ struct AVFormatOutputWrapper {
     writer: Option<ManuallyDrop<Box<BufWriter<File>>>>,
 }
 
+unsafe extern "C" fn interrupt_callback(arg1: *mut libc::c_void) -> libc::c_int {
+    println!("interrupt_callback => {:?}", arg1);
+    0
+}
+
 impl AVFormatContextWrapper {
     fn new<T: AsRef<Path>>(path: T, input: bool, output: bool) -> Option<Self> {
         unsafe {
             let (reader, input_format_ctx) = if input {
                 let mut format_ctx = ffmpeg_next::ffi::avformat_alloc_context();
+
+                (*format_ctx).error_recognition = 0; // 最大容错
+                (*format_ctx).max_analyze_duration = 3_000_000; // 3秒分析限制
+                (*format_ctx).probesize = 5_000_000; // 5MB probe限制
+                (*format_ctx).flags |= ffmpeg_next::ffi::AVFMT_FLAG_GENPTS;
+
+                (*format_ctx).interrupt_callback.callback = Some(interrupt_callback);
+
                 let buffer_size = 4 * 1024;
                 let buffer = ffmpeg_next::ffi::av_malloc(buffer_size) as *mut u8;
                 if buffer.is_null() {
                     log::error!("Failed to allocate buffer");
                     return None;
                 }
+
+                if let Some(parent) = path.as_ref().parent() {
+                    std::fs::create_dir_all(parent)
+                        .context(format!("创建目录失败: {:?}", parent))
+                        .ok();
+                }
+
+                log::info!("file path: {:?}", path.as_ref());
 
                 let file = File::open(path.as_ref()).unwrap();
                 let reader = ManuallyDrop::new(Box::new(BufReader::new(file)));
@@ -154,8 +175,10 @@ impl AVFormatContextWrapper {
                     return None;
                 }
 
-                (*format_ctx).flags |= ffmpeg_next::ffi::AVFMT_FLAG_CUSTOM_IO;
+                (*format_ctx).flags |=
+                    ffmpeg_next::ffi::AVFMT_FLAG_CUSTOM_IO | ffmpeg_next::ffi::AVFMT_FLAG_IGNIDX;
 
+                (*format_ctx).interrupt_callback.callback = Some(interrupt_callback);
                 (Some(writer), format_ctx)
             } else {
                 (None, ptr::null_mut())
@@ -218,6 +241,13 @@ impl Drop for AVFormatContextWrapper {
     }
 }
 
+// 根据平台定义不同的缓冲区指针类型
+#[cfg(target_os = "macos")]
+type FfmpegBufferPtr = *const u8;
+
+#[cfg(not(target_os = "macos"))]
+type FfmpegBufferPtr = *mut u8;
+
 unsafe extern "C" fn self_read_packet(
     opaque: *mut libc::c_void,
     buf: *mut u8,
@@ -226,8 +256,9 @@ unsafe extern "C" fn self_read_packet(
     let reader = unsafe { &mut *(opaque as *mut BufReader<File>) };
     let slice = unsafe { std::slice::from_raw_parts_mut(buf, buf_size as usize) };
     match reader.read(slice) {
+        Ok(0) => ffmpeg_next::ffi::AVERROR_EOF,
         Ok(size) => size as libc::c_int,
-        Err(_) => return -1,
+        Err(_) => ffmpeg_next::ffi::AVERROR(libc::EIO),
     }
 }
 
@@ -269,7 +300,7 @@ unsafe extern "C" fn self_seek(opaque: *mut libc::c_void, offset: i64, whence: l
 
 unsafe extern "C" fn self_write_packet(
     opaque: *mut libc::c_void,
-    buf: *mut u8,
+    buf: FfmpegBufferPtr,
     buf_size: libc::c_int,
 ) -> libc::c_int {
     unsafe {
@@ -325,7 +356,7 @@ async fn download_file(file_url: &str) -> anyhow::Result<String> {
     log::info!("Downloading file: {}", file_url);
 
     Ok(tokio::time::timeout(
-        tokio::time::Duration::from_secs(60),
+        tokio::time::Duration::from_secs(600),
         download_with_process(file_url),
     )
     .await
@@ -353,6 +384,8 @@ async fn download_with_process(file_url: &str) -> anyhow::Result<String> {
     let content_length = response.content_length();
 
     let file_path = std::env::temp_dir().join(&file_name);
+
+    log::info!("file_path: {:?}", file_path);
 
     let pb = if let Some(size) = content_length {
         let pb = ProgressBar::new(size);
@@ -395,16 +428,6 @@ async fn download_with_process(file_url: &str) -> anyhow::Result<String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
-    let input_media_file = if args.input.starts_with("http") || args.input.starts_with("https") {
-        download_file(&args.input).await?.to_string()
-    } else {
-        args.input
-    };
-
-    log::info!("input_media_file: {:?}", input_media_file);
-
     Builder::new()
         .format(|buf, record| {
             writeln!(
@@ -417,8 +440,24 @@ async fn main() -> anyhow::Result<()> {
                 record.args()
             )
         })
-        .filter_level(LevelFilter::Info)
+        .filter_level(LevelFilter::Debug)
         .init();
+
+    let args = Args::parse();
+
+    unsafe {
+        if args.verbose {
+            ffmpeg_next::ffi::av_log_set_level(ffmpeg_next::ffi::AV_LOG_TRACE);
+        }
+    }
+
+    let input_media_file = if args.input.starts_with("http") || args.input.starts_with("https") {
+        download_file(&args.input).await?.to_string()
+    } else {
+        args.input
+    };
+
+    log::info!("input_media_file: {:?}", input_media_file);
 
     analyze_input(&input_media_file)?;
 
@@ -438,7 +477,11 @@ async fn main() -> anyhow::Result<()> {
     let mut data_packets = HashMap::new();
     let mut unknown_packets = HashMap::new();
 
+    let mut packet_count = 0;
+
     for packet in self_input.packets() {
+        packet_count += 1;
+
         let (s, p) = packet;
 
         match s.parameters().medium() {
@@ -481,6 +524,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    log::info!("\n读取完成, 已读取 {} 个packets\n", packet_count);
     let streams = self_input.streams();
 
     for (idx, stream) in streams.enumerate() {
