@@ -551,87 +551,55 @@ async fn main() -> anyhow::Result<()> {
 
         let medium_type = stream.parameters().medium();
 
-        match medium_type {
-            ffmpeg_next::media::Type::Video | ffmpeg_next::media::Type::Audio => {
-                let avformat_wrapper_output =
-                    AVFormatContextWrapper::new(&output_path, false, true);
-                let (self_output, writer) = avformat_wrapper_output.unwrap().into_output();
+        let packets: Option<&mut Vec<ffmpeg_next::Packet>> = match medium_type {
+            ffmpeg_next::media::Type::Audio => audio_packets.get_mut(&stream_index),
+            ffmpeg_next::media::Type::Video => video_packets.get_mut(&stream_index),
+            ffmpeg_next::media::Type::Data => data_packets.get_mut(&stream_index),
+            ffmpeg_next::media::Type::Attachment => attachment_packets.get_mut(&stream_index),
+            ffmpeg_next::media::Type::Subtitle => subtitle_packets.get_mut(&stream_index),
+            ffmpeg_next::media::Type::Unknown => unknown_packets.get_mut(&stream_index),
+        };
 
-                let mut output_with_custom_io = OutputWithCustomIO::new(self_output, writer);
+        if !packets.as_ref().is_some_and(|p| !p.is_empty()) {
+            log::warn!("流 #{} 没有包", stream_index);
+            continue;
+        }
 
-                if let Some(parent) = output_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .context(format!("创建输出目录失败: {:?}", parent))?;
-                }
+        let avformat_wrapper_output = AVFormatContextWrapper::new(&output_path, false, true);
+        let (self_output, writer) = avformat_wrapper_output.unwrap().into_output();
 
-                let mut output_stream = output_with_custom_io
-                    .output_mut()
-                    .add_stream(ffmpeg_next::encoder::find(stream.parameters().id()))
-                    .context("添加流失败")?;
+        let mut output_with_custom_io = OutputWithCustomIO::new(self_output, writer);
 
-                output_stream.set_parameters(stream.parameters());
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent).context(format!("创建输出目录失败: {:?}", parent))?;
+        }
 
-                output_with_custom_io
-                    .output_mut()
-                    .write_header()
-                    .context("写入音频文件头失败")?;
+        let mut output_stream = output_with_custom_io
+            .output_mut()
+            .add_stream(ffmpeg_next::encoder::find(stream.parameters().id()))
+            .context("添加流失败")?;
 
-                let packets = if medium_type == ffmpeg_next::media::Type::Audio {
-                    audio_packets.get_mut(&stream_index)
-                } else {
-                    data_packets.get_mut(&stream_index)
-                };
+        output_stream.set_parameters(stream.parameters());
 
-                if let Some(packets) = packets {
-                    for p in packets {
-                        p.set_stream(0);
-                        p.write_interleaved(output_with_custom_io.output_mut())
-                            .context("写入音频包失败")?;
-                    }
-                }
+        output_with_custom_io
+            .output_mut()
+            .write_header()
+            .context("写入文件头失败")?;
 
-                output_with_custom_io
-                    .output_mut()
-                    .write_trailer()
-                    .context("写入音频文件尾失败")?;
-            }
+        if let Some(packets) = packets {
+            packets.sort_by_key(|p| p.dts().unwrap_or(0));
 
-            _ => {
-                let avformat_wrapper_output =
-                    AVFormatContextWrapper::new(&output_path, false, true);
-                let (self_output, writer) = avformat_wrapper_output.unwrap().into_output();
-
-                let mut output_with_custom_io = OutputWithCustomIO::new(self_output, writer);
-
-                if let Some(parent) = output_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .context(format!("创建输出目录失败: {:?}", parent))?;
-                }
-
-                let mut output_stream = output_with_custom_io
-                    .output_mut()
-                    .add_stream(ffmpeg_next::encoder::find(stream.parameters().id()))
-                    .context("添加流失败")?;
-
-                output_stream.set_parameters(stream.parameters());
-
-                if let Some(packets) = match medium_type {
-                    ffmpeg_next::media::Type::Data => data_packets.get_mut(&stream_index),
-                    ffmpeg_next::media::Type::Attachment => {
-                        attachment_packets.get_mut(&stream_index)
-                    }
-                    ffmpeg_next::media::Type::Subtitle => subtitle_packets.get_mut(&stream_index),
-                    ffmpeg_next::media::Type::Unknown => unknown_packets.get_mut(&stream_index),
-                    _ => None,
-                } {
-                    for p in packets {
-                        p.set_stream(0);
-                        p.write_interleaved(output_with_custom_io.output_mut())
-                            .context("写入失败")?;
-                    }
-                }
+            for p in packets {
+                p.set_stream(0);
+                p.write_interleaved(output_with_custom_io.output_mut())
+                    .context("写入包失败")?;
             }
         }
+
+        output_with_custom_io
+            .output_mut()
+            .write_trailer()
+            .context("写入文件尾失败")?;
     }
 
     Ok(())
