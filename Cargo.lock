@@ -365,24 +365,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ffmpeg_split_audit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "clap_derive",
- "env_logger",
- "ffmpeg-next",
- "futures-util",
- "indicatif",
- "libc",
- "log",
- "reqwest",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -926,6 +908,24 @@ name = "log"
 version = "0.4.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
+
+[[package]]
+name = "media_tool"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_derive",
+ "env_logger",
+ "ffmpeg-next",
+ "futures-util",
+ "indicatif",
+ "libc",
+ "log",
+ "reqwest",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "memchr"

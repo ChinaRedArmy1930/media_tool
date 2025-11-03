@@ -1,5 +1,5 @@
 [package]
-name = "ffmpeg_split_audit"
+name = "media_tool"
 version = "0.1.0"
 edition = "2024"
 

@@ -3,3 +3,4 @@
 core.*
 test_output
 .DS_Store
+test_data/
