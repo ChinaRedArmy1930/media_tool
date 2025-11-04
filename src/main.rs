@@ -3,13 +3,16 @@ use clap::Parser;
 use std::io::Write;
 
 mod media_tool {
+    pub mod mono_to_stereo;
     pub mod stream_split;
 }
 
 mod common {
     pub mod common;
+    pub mod utils;
 }
 
+use media_tool::mono_to_stereo;
 use media_tool::stream_split;
 
 #[derive(Parser, Debug)]
@@ -34,6 +37,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    ffmpeg_next::init().unwrap();
+
     env_logger::Builder::new()
         .format(|buf, record| {
             writeln!(
@@ -55,6 +60,11 @@ async fn main() -> anyhow::Result<()> {
             stream_split::stream_split(&args.input, args.output.as_deref(), args.verbose)
                 .await
                 .context("stream split failed")?;
+        }
+        "mono_to_stereo" => {
+            mono_to_stereo::mono_to_stereo(&args.input, args.output.as_deref(), args.verbose, None)
+                .await
+                .map_err(|e| anyhow::anyhow!("mono to stereo failed: {}", e))?;
         }
         _ => {
             anyhow::bail!("invalid method");

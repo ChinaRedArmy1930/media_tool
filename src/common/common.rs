@@ -322,15 +322,15 @@ impl Drop for OutputWithCustomIO {
     fn drop(&mut self) {
         unsafe {
             let format_ctx = self.output.as_mut_ptr();
-
             if !(*format_ctx).pb.is_null() {
                 let pb = (*format_ctx).pb;
                 ffmpeg_next::ffi::avio_flush(pb);
                 let buffer = (*pb).buffer;
+                ffmpeg_next::ffi::av_free(buffer as *mut _);
+                (*pb).buffer = ptr::null_mut();
                 (*format_ctx).pb = ptr::null_mut();
                 let mut pb_temp = pb;
                 ffmpeg_next::ffi::avio_context_free(&mut pb_temp);
-                ffmpeg_next::ffi::av_free(buffer as *mut _);
             }
 
             ManuallyDrop::drop(&mut self.output);
