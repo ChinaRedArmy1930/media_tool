@@ -234,13 +234,13 @@ pub async fn mono_to_stereo(
 
     let mut self_output = output_with_custom_io.output_mut();
 
-    let default_filter = "anull";
+    //let default_filter = "anull";
     let filter: &str = "pan=stereo|c0=c0|c1=c0";
     let mut transcoder = transcoder(
         &mut self_input,
         &mut self_output,
         &output.clone().unwrap(),
-        &default_filter,
+        &filter,
     )
     .map_err(|e| anyhow::anyhow!("failed to create transcoder: {}", e))?;
 

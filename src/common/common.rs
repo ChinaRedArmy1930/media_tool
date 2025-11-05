@@ -22,8 +22,7 @@ pub struct AVFormatOutputWrapper {
     writer: Option<ManuallyDrop<Box<BufWriter<File>>>>,
 }
 
-unsafe extern "C" fn interrupt_callback(arg1: *mut libc::c_void) -> libc::c_int {
-    println!("interrupt_callback => {:?}", arg1);
+unsafe extern "C" fn interrupt_callback(_arg1: *mut libc::c_void) -> libc::c_int {
     0
 }
 
@@ -87,6 +86,15 @@ impl AVFormatContextWrapper {
                 );
                 if result < 0 {
                     log::error!("Failed to open input");
+                    ffmpeg_next::ffi::av_free(buffer as *mut _);
+                    ffmpeg_next::ffi::avformat_free_context(format_ctx);
+                    ManuallyDrop::drop(&mut ManuallyDrop::new(reader));
+                    return None;
+                }
+
+                let ret = ffmpeg_next::ffi::avformat_find_stream_info(format_ctx, ptr::null_mut());
+                if ret < 0 {
+                    log::error!("Failed to find stream info");
                     ffmpeg_next::ffi::av_free(buffer as *mut _);
                     ffmpeg_next::ffi::avformat_free_context(format_ctx);
                     ManuallyDrop::drop(&mut ManuallyDrop::new(reader));
