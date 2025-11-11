@@ -3,6 +3,7 @@ use clap::Parser;
 use std::io::Write;
 
 mod media_tool {
+    pub mod auto_pan_swirl;
     pub mod mono_to_stereo;
     pub mod stream_split;
 }
@@ -12,6 +13,7 @@ mod common {
     pub mod utils;
 }
 
+use media_tool::auto_pan_swirl;
 use media_tool::mono_to_stereo;
 use media_tool::stream_split;
 
@@ -66,6 +68,13 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("mono to stereo failed: {}", e))?;
         }
+
+        "auto_pan_swirl" => {
+            auto_pan_swirl::auto_pan_swirl(&args.input, args.output.as_deref(), args.verbose, None)
+                .await
+                .map_err(|e| anyhow::anyhow!("auto pan swirl failed: {}", e))?;
+        }
+
         _ => {
             anyhow::bail!("invalid method");
         }
